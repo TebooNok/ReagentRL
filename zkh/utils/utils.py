@@ -9,6 +9,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import math
 import os
+import requests
+# from vllm import SamplingParams
+import time
+from datasets import load_from_disk
 
 def set_random_seed(seed=42):
     random.seed(seed)
@@ -17,6 +21,42 @@ def set_random_seed(seed=42):
 
 def get_time():
     return strftime('%Y-%m-%d-%H-%M', localtime())
+
+def set_timer():
+    return time.time()
+
+def end_timer(st_time):
+    cur_time = time.time()
+    total_seconds = int(cur_time - st_time)
+    
+    S = total_seconds % 60
+    M = total_seconds // 60
+    if M < 60:
+        return f"{M} min {S} s"
+    else:
+        H = M // 60
+        M = M % 60
+        return f"{H} hour {M} min {S} s"
+
+### basic util
+def retrieve_documents(queries, topk=3):
+    url = "http://124.220.175.42:8000/retrieve"
+    headers = {"Content-Type": "application/json"}
+    
+    # 构造请求数据
+    payload = {
+        "queries": queries,  # 可以是单个字符串或字符串列表
+        "topk": topk,
+        "return_scores": True
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        response.raise_for_status()  # 检查请求是否成功
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"请求失败: {e}")
+        return None
 
 ### indicator
 def calculate_self_bleu(texts, n_gram=3):
@@ -34,60 +74,138 @@ def calculate_self_bleu(texts, n_gram=3):
         scores.append(score)
     return sum(scores) / len(scores)
 
-def calculate_avg_pair_distance(texts, embedding_model):
-    n = len(texts)
-    if n <= 1:
-        return 0
+def calculate_avg_pair_distance(texts, group_list, embedding_model):
+    all_embeddings = embedding_model.encode(texts, batch_size=1024, show_progress_bar=True)
     
-    pairs = set()
-    for i in range(n):
-        for j in range(n):
-            if j == i:
-                continue
-            p = sorted([i, j])
-            if tuple(p) not in pairs:
-                pairs.add(tuple(p))
+    st = 0
+    distances = []
+    for group_len in group_list:
+        ed = st + group_len
+        
+        embeddings = all_embeddings[st: ed, :]
+        
+        cos_sim = cosine_similarity(embeddings)
+        upper_triangle = np.triu(cos_sim, k = 1)
+        if np.prod(upper_triangle.shape) == 1:
+            distances.append(1.0)
+        else:
+            distances.append(float(np.sum(upper_triangle)) * 2 / (group_len * (group_len - 1)))
     
-    avg_distance = 0.
-    for p in pairs:
-        embedding1 = embedding_model.encode(texts[p[0]])
-        embedding2 = embedding_model.encode(texts[p[1]])
-        cos_sim = cosine_similarity([embedding1], [embedding2])
-        avg_distance += 1 - cos_sim
+        st = ed
     
-    if type(avg_distance) == float:
-        return avg_distance
+    return distances
+
+def calculate_action_coverage(texts, topk=3):
+    results = retrieve_documents(texts, topk)
+    
+    ids = []
+    for i, r in enumerate(results['result']):
+        # print(f"Response for query {i + 1}:")
+        # print(f"{d['document']['id']}: {d['document']['contents']}")
+        ids.append([d['document']['id'] for d in r])
+        # print('*' * 60)
+    ### ids = [[1, 2, 3], [2, 3, 4],...]
+    record = set()
+    for i in range(0, len(ids)):
+        dedup_docs = [doc for doc in ids[i] if doc not in record]
+        
+        ids[i] = dedup_docs
+        for doc in dedup_docs:
+            record.add(doc)
+
+    return [len(docs) for docs in ids]
+
+def compute_sentence_token_len(xs, tokenizer):
+    mm = tokenizer(xs, padding=True, return_tensors='pt').to('cuda:0')
+    xl = torch.sum(mm['attention_mask'], dim=1, keepdim=False)
+    return xl.tolist()
+
+def calculate_entropy(qa, model, tokenizer, group_list=None, seed=42):
+    from vllm import SamplingParams
+
+    num_response_list = [len(responses) for responses in qa.values()]
+    all_responses = [response for responses in qa.values() for response in responses]
+    len_list = compute_sentence_token_len(all_responses, tokenizer)
+
+    prompts = [x + y for x in qa.keys() for y in qa[x]]
+
+    sampling_params = SamplingParams(max_tokens=1, prompt_logprobs=1, seed=seed)
+    outputs = model.generate(prompts, sampling_params)
+
+    logprob_list = [output.prompt_logprobs for output in outputs]
+    token_id_list = [output.prompt_token_ids for output in outputs]
+
+    entropys, logprob4all = [], []
+    st = 0
+    for batch_size in num_response_list:
+        ed = st + batch_size
+        logprobs = logprob_list[st: ed]
+        token_ids = token_id_list[st: ed]
+        suffix_len_list = len_list[st: ed]
+
+        lps = []
+        for id_entry, logprob_entry, suffix_len in zip(token_ids, logprobs, suffix_len_list):
+            id = id_entry[-suffix_len:]
+            logprob = logprob_entry[-suffix_len:]
+
+            lp = 0.0
+            for a, b in zip(id, logprob):
+                lp += b[a].logprob
+                # print(b[a].decoded_token)
+
+            lps.append(lp / float(suffix_len)) # normalized logprob
+
+        if group_list is None:
+            entropy = 0.0
+            for lp in lps:
+                entropy += - math.exp(lp) * lp
+            
+            entropys.append(entropy)
+        else:
+            logprob4all.append(lps[0])
+        
+        st = ed
+        
+    if group_list is None:
+        return entropys
     else:
-        return (avg_distance / len(pairs)).item()
+        st = 0
+        for group_len in group_list:
+            ed = st + group_len
+            lps = logprob4all[st: ed]
+            
+            entropy = 0.0
+            for lp in lps:
+                entropy += - math.exp(lp) * lp
+            
+            entropys.append(entropy)
+            st = ed
+        return entropys
 
 ### plot
-def plot(fn, show_entrophy=False, cot_type='withcot'):
-    timestamp = get_time()
-    img_path = f"../img/{timestamp}_{cot_type}"
+def plot(fn, action_detail=True):
+    # timestamp = get_time()
+    name = fn.split('/')[-1]
+    img_path = f"../img/{name}"
     os.makedirs(img_path, exist_ok=True)
     
-    entrophy, bleu, embedding_dist, action_coverage = [], [], [], []
-    with open(fn, 'r', encoding='utf-8') as fo:
-        for line in fo:
-            entry = json.loads(line)
-            entrophy.append(math.log(entry['entrophy']) + 580),
-            bleu.append(entry['self-BLEU'])
-            embedding_dist.append(entry['avg_paired_distance'])
-            action_coverage.append(entry['action_count'])
-            # print(entry['action_count'][:10], entry['entrophy'], entry['self-BLEU'], entry['avg_paired_distance'])
+    ds = load_from_disk(fn)
+    entropy_cot = [math.log(entry['entropy_cot']) for entry in ds]
+    entropy = [math.log(entry['entropy']) for entry in ds]
+    bleu = [entry['self-BLEU'] for entry in ds]
+    embedding_dist = [min(entry['avg_paired_distance'], 1.0) for entry in ds]
+    action_coverage = [np.cumsum(entry['action_coverage']).tolist() for entry in ds]
     
-    data = [entrophy, bleu, embedding_dist]
-    label = ['entrophy', 'self-BLEU', 'avg paired distance']
-    if not show_entrophy:
-        data.pop(0)
-        label.pop(0)
+    
+    data = [entropy_cot, entropy, bleu, embedding_dist]
+    label = ['entropy_cot', 'entropy', 'self-BLEU', 'avg paired distance']
 
     # 创建箱线图
     plt.figure(figsize=(10, 6))  # 设置图形大小
     plt.boxplot(data, labels=label)  # 设置标签
 
     # 添加标题和坐标轴标签
-    plt.title(f"Boxplot of {'Three' if show_entrophy else 'Two'} Indicators", fontsize=15)
+    plt.title(f"Boxplot of Four Indicators", fontsize=15)
     plt.xlabel('Indicators', fontsize=12)
     plt.ylabel('Values', fontsize=12)
 
@@ -96,17 +214,17 @@ def plot(fn, show_entrophy=False, cot_type='withcot'):
     plt.savefig(f"{img_path}/indicators.svg")
     # plt.show()
 
+    if action_detail:
+        sns.set_theme(style="darkgrid")
+        plt.figure(figsize=(10, 6))
+        for i, line in enumerate(action_coverage):
+            sns.lineplot(x=range(len(line)), y=line, label=f'Line {i+1}')
 
-    sns.set_theme(style="darkgrid")
-    plt.figure(figsize=(10, 6))
-    for i, line in enumerate(action_coverage):
-        sns.lineplot(x=range(len(line)), y=line, label=f'Line {i+1}')
-
-    plt.title('Action Coverage', fontsize=14)
-    plt.xlabel('Timestep', fontsize=12)
-    plt.ylabel('Count of Action', fontsize=12)
-    plt.legend()
-    plt.savefig(f"{img_path}/raw_action_coverage.svg")
+        plt.title('Action Coverage', fontsize=14)
+        plt.xlabel('Timestep', fontsize=12)
+        plt.ylabel('Count of Action', fontsize=12)
+        plt.legend()
+        plt.savefig(f"{img_path}/raw_action_coverage.svg")
 
     fig, ax = plt.subplots(figsize=(10, 6))
     action_coverage = np.array(action_coverage)
@@ -127,9 +245,8 @@ def plot(fn, show_entrophy=False, cot_type='withcot'):
     plt.tight_layout()
     # plt.savefig('gan_loss_ci.png', dpi=300, bbox_inches='tight')
     plt.savefig(f"{img_path}/action_coverage.svg")
-
+    
 
 if __name__ == '__main__':
-    # print(get_time())
-    plot('../log/Qwen2.5-3B-Instruct-20q-100r-withoutcot-111-2025-06-02-22-30.jsonl', cot_type='withoutcot')
-    plot('../log/Qwen2.5-3B-Instruct-20q-100r-withcot-111-2025-06-02-20-20.jsonl')
+    
+    plot('../log/Qwen2.5-3B-Instruct-20q-100r-withcot-42-2025-06-20-16-30')
